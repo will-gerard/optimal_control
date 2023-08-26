@@ -34,6 +34,10 @@ We also need the ![robot-descriptions]() package to get a pinocchio-compatible d
 conda install -c conda-forge robot_descriptions
 ```
 
+## Notes about installation issues
+I have burned a lot of time trying g to install crocoddyl in differetn ways on two different machines. On Ubuntu 20.04, after installing directly with conda-forge, I was not able to import the package into a python interpreter. This was true on both python 3.11 and python 3.10. With python 3.8, it worked, and I was able to import the pakcage successfully. However, all I could install into the conda env was version 1.7 of crocoddyl, which appears to be very out of date, and important classes I tried to 
+import into c++, like https://gepettoweb.laas.fr/doc/loco-3d/crocoddyl/master/doxygen-html/classcrocoddyl_1_1ResidualModelStateTpl.html, coulnd't be included. I think the solution is to use Ubuntu 22.04, python 3.10 or 3.11.
+
 ## Running the test
 In one terminal, run the gepetto-gui. Assuming it was installed correctly:
 
