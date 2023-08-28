@@ -11,7 +11,7 @@ robot: pinocchio.RobotWrapper = load_robot_description("iiwa_description")
 robot_model = robot.model
 
 DT = 1e-3
-KNOT_POINTS = 512
+KNOT_POINTS = 32
 NUM_CONTROLS = 7
 
 cameraTF = [2.0, 2.68, 0.54, 0.2, 0.62, 0.72, 0.22]
@@ -45,8 +45,12 @@ x0 = h_xu_traj[:14]
 state_differential_model = crocoddyl.StateMultibody(robot_model)
 
 # Initialize matrices Q and R for state and control tracking cost
-Q = np.eye(state_differential_model.nx) * 0.1  # 1 is the weight for the state tracking
-R = np.eye(NUM_CONTROLS) * 0.0001  # 1 is the weight for the control tracking
+Q_COST = 0.1
+R_COST = 0.0001
+# set Q to a column vector of length state_differential_model.nx and value 0.1
+
+Q = np.full((state_differential_model.nx, 1), Q_COST)
+R = np.full((NUM_CONTROLS, 1), R_COST)
 
 # 1. Update desired state and control sequences based on the current state
 # x_des, u_des = get_desired_trajectory_slice(x0, N)  # Implement this function based on your application
@@ -61,37 +65,31 @@ runningCostModel = crocoddyl.CostModelSum(state_differential_model)
 terminalCostModel = crocoddyl.CostModelSum(state_differential_model)
 # at first I thought I had to loop over every know and add the cost for that point, now I think 
 # I just need to add the cost for the whole trajectory with the state differential model
-# for t in range(KNOT_POINTS):
-#     x_ref_t = target_traj_x[t]
-#     u_ref_t = target_traj_u[t]
+for t in range(KNOT_POINTS):
+    x_ref_t = target_traj_x[t]
+    u_ref_t = target_traj_u[t]
     
-#     # per https://gepettoweb.laas.fr/doc/loco-3d/crocoddyl/master/doxygen-html/classcrocoddyl_1_1CostModelResidualTpl.html#details
-#     # ActivationModelQuadTpl is used by default, so not passing an activation model to this cost residual
-#     state_tracking_cost = crocoddyl.CostModelResidual(state_differential_model, 
-#                                                     crocoddyl.ResidualModelState(state_differential_model, x_ref_t))
-#     control_tracking_cost = crocoddyl.CostModelResidual(state_differential_model,
-#                                                     crocoddyl.ResidualModelControl(state_differential_model, u_ref_t))
+    # per https://gepettoweb.laas.fr/doc/loco-3d/crocoddyl/master/doxygen-html/classcrocoddyl_1_1CostModelResidualTpl.html#details
+    # ActivationModelQuadTpl is used by default
+    # if we didn't care about Q, this would be fine, but I want to be able to set Q
+    # So for this we need the ActivationModelWeightedQuad
+    # https://gepettoweb.laas.fr/doc/loco-3d/crocoddyl/master/doxygen-html/classcrocoddyl_1_1ActivationModelWeightedQuadTpl.html
+    activation_state = crocoddyl.ActivationModelWeightedQuad(Q)
+    state_error_residual = crocoddyl.ResidualModelState(state_differential_model, x_ref_t)
+    state_tracking_cost = crocoddyl.CostModelResidual(state_differential_model, activation_state, state_error_residual)
+    runningCostModel.addCost("stateTrack" + str(t), state_tracking_cost, 1.)
 
-#     runningCostModel.addCost("stateTrack" + str(t), state_tracking_cost, 1.)
-#     runningCostModel.addCost("ctrlTrack" + str(t), control_tracking_cost, 1.)
+    # add control tracking cost if we are not at the last knot point
+    if t < KNOT_POINTS - 1:
+        activation_control = crocoddyl.ActivationModelWeightedQuad(R)
+        control_error_residual = crocoddyl.ResidualModelControl(state_differential_model, u_ref_t)
+        control_tracking_cost = crocoddyl.CostModelResidual(state_differential_model, activation_control, control_error_residual)
+        runningCostModel.addCost("ctrlTrack" + str(t), control_tracking_cost, 0.001)
+
 x_ref_t = target_traj_x[-1]
 u_ref_t = np.zeros(NUM_CONTROLS)
 
-# print x_ref_t
-print("x_ref_t")
-print(x_ref_t)
-
-# per https://gepettoweb.laas.fr/doc/loco-3d/crocoddyl/master/doxygen-html/classcrocoddyl_1_1CostModelResidualTpl.html#details
-# ActivationModelQuadTpl is used by default, so not passing an activation model to this cost residual
-state_tracking_cost = crocoddyl.CostModelResidual(state_differential_model, 
-                                                crocoddyl.ResidualModelState(state_differential_model, x_ref_t))
-# control_tracking_cost = crocoddyl.CostModelResidual(state_differential_model,
-#                                                 crocoddyl.ResidualModelControl(state_differential_model, u_ref_t))
-
-runningCostModel.addCost("stateTrack", state_tracking_cost, 1.)
-#runningCostModel.addCost("ctrlTrack", control_tracking_cost, 1.)
-
-terminalCostModel.addCost("stateTrack", state_tracking_cost, 100)
+terminalCostModel.addCost("stateTrack", state_tracking_cost, 10000)
 
 
 running_model = crocoddyl.IntegratedActionModelEuler(
@@ -110,8 +108,14 @@ problem = crocoddyl.ShootingProblem(x0, [running_model] * KNOT_POINTS, terminal_
 ddp = crocoddyl.SolverDDP(problem)
 ddp.setCallbacks([crocoddyl.CallbackVerbose()])
 
+# time how long the ddp solve takes
+import time
+time_limit = 0.01
+start_time = time.time()
 # Solving it with the DDP algorithm
 ddp.solve()
+end_time = time.time()
+print("DDP solve time: ", end_time - start_time)
 
 # Visualizing the solution in gepetto-viewer
 display.displayFromSolver(ddp)
@@ -121,7 +125,13 @@ xT = ddp.xs[-1]
 pinocchio.forwardKinematics(robot_model, robot_data, xT[: state_differential_model.nq])
 pinocchio.updateFramePlacements(robot_model, robot_data)
 
+print("initial x")
+print(x0)
+# print x_ref_t
+print("x_ref_t")
+print(x_ref_t)
 # print final x
+print("And the final x:")
 print(xT)
 
 # Actual tracking stuff, just going to try a single solve for now
