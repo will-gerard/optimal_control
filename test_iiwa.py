@@ -1,6 +1,8 @@
 import numpy as np
 import pinocchio
 
+import example_robot_data
+
 import crocoddyl
 import os
 print("Current Working Directory:", os.getcwd())
@@ -9,6 +11,15 @@ from robot_descriptions.loaders.pinocchio import load_robot_description
 
 robot: pinocchio.RobotWrapper = load_robot_description("iiwa_description")
 robot_model = robot.model
+
+q = np.zeros(robot.nq)
+pinocchio.forwardKinematics(robot.model, robot.data, q)
+
+# joint 7 is the final joint in iiwa
+# executed forward kinematics on the robot from some random starting configurations,
+# validated that the position of joint 7 is the same as the position of the end effector from when 
+# grid compute end effector location is run from the same starting position
+joint_7_index = robot.model.getFrameId("iiwa_joint_7")
 
 DT = 1e-3
 KNOT_POINTS = 32
@@ -52,22 +63,26 @@ R_COST = 0.0001
 Q = np.full((state_differential_model.nx, 1), Q_COST)
 R = np.full((NUM_CONTROLS, 1), R_COST)
 
+# EE cost multiplier is hardcoded to 0.5
+COST_MATRIX_EE = np.full((3, 1), 0.5)
+
 # 1. Update desired state and control sequences based on the current state
 # x_des, u_des = get_desired_trajectory_slice(x0, N)  # Implement this function based on your application
 # for now only look at the first 32 points
 target_traj_x = xu_traj2d[0:KNOT_POINTS, 0:14]
 target_traj_u = xu_traj2d[0:KNOT_POINTS, 14:]
 
+target_ee_traj = eePos_traj2d[0:KNOT_POINTS]
 
 # 2. Update the cost models for the N-steps lookahead
 actuation = crocoddyl.ActuationModelFull(state_differential_model)
 runningCostModel = crocoddyl.CostModelSum(state_differential_model)
 terminalCostModel = crocoddyl.CostModelSum(state_differential_model)
-# at first I thought I had to loop over every know and add the cost for that point, now I think 
-# I just need to add the cost for the whole trajectory with the state differential model
+
 for t in range(KNOT_POINTS):
     x_ref_t = target_traj_x[t]
     u_ref_t = target_traj_u[t]
+    ee_pos_ref_t = target_ee_traj[t]
     
     # per https://gepettoweb.laas.fr/doc/loco-3d/crocoddyl/master/doxygen-html/classcrocoddyl_1_1CostModelResidualTpl.html#details
     # ActivationModelQuadTpl is used by default
@@ -77,7 +92,19 @@ for t in range(KNOT_POINTS):
     activation_state = crocoddyl.ActivationModelWeightedQuad(Q)
     state_error_residual = crocoddyl.ResidualModelState(state_differential_model, x_ref_t)
     state_tracking_cost = crocoddyl.CostModelResidual(state_differential_model, activation_state, state_error_residual)
-    runningCostModel.addCost("stateTrack" + str(t), state_tracking_cost, 1.)
+
+    # don't actually add this to running cost for now, we don't include state offset in the loss function in gpu pcg tracking
+    # runningCostModel.addCost("stateTrack" + str(t), state_tracking_cost, 1.)
+    
+    activation_ee = crocoddyl.ActivationModelWeightedQuad(COST_MATRIX_EE)
+    goalTrackingCostXYZ = crocoddyl.CostModelResidual(
+        state_differential_model,
+        activation_ee,
+        crocoddyl.ResidualModelFrameTranslation(
+            state_differential_model, joint_7_index, ee_pos_ref_t[0:3]
+        ),
+    )
+    runningCostModel.addCost("goalTrackXYZ" + str(t), goalTrackingCostXYZ, 1.)
 
     # add control tracking cost if we are not at the last knot point
     if t < KNOT_POINTS - 1:
@@ -89,7 +116,7 @@ for t in range(KNOT_POINTS):
 x_ref_t = target_traj_x[-1]
 u_ref_t = np.zeros(NUM_CONTROLS)
 
-terminalCostModel.addCost("stateTrack", state_tracking_cost, 10000)
+# terminalCostModel.addCost("stateTrack", state_tracking_cost, 10000)
 
 
 running_model = crocoddyl.IntegratedActionModelEuler(
